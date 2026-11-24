@@ -10,7 +10,7 @@ import { SCHOLARSHIP_TEXT, SCHOLARSHIP_TITLE } from '../src/fixtures/scholarship
 import { MemoryStore } from '../tests/support/memory-store';
 import { ScriptedCloudPort, ScriptedLocalPort, cloudReview, localAnswer } from '../tests/support/scripted-ports';
 import { clock, idGen } from '../tests/support/builders';
-import { adminList, adminPut, clearAll, newClient, signIn, signUp, type Client } from './support';
+import { adminList, adminPut, adminTimestamp, clearAll, newClient, signIn, signUp, type Client } from './support';
 
 const QUOTE = 'Applications must be received by 17:00 WAT on 15 December 2026';
 const CLAIM = 'The deadline is 17:00 WAT on 15 December 2026.';
@@ -76,7 +76,7 @@ test('DOCUMENT TEXT NEVER REACHES FIRESTORE: every stored record is scanned for 
   for (const d of devices) {
     for (const e of await adminList(`users/${uid}/devices/${d.id}/events`)) {
       storedChars += JSON.stringify(e.fields).length;
-      events.push({ payload: JSON.parse(String(e.fields.payloadJson)) });
+      events.push({ payload: e.fields.payload });
     }
   }
   assert.ok(events.length >= 5);
@@ -143,7 +143,7 @@ test('TAMPERED/INVALID server events are quarantined by the real engine; healthy
   await a.svc.importDocument('A doc', 'alpha');
   await a.sync.sync();
   await adminPut(`users/${uid}/devices/dev-z`, { deviceId: 'dev-z' });
-  await adminPut(`users/${uid}/devices/dev-z/events/0000000001`, { id: eventId('dev-z', 1), deviceId: 'dev-z', seq: 1, hlc: 'not-an-hlc', kind: 'doc_registered', payloadJson: '{}' });
+  await adminPut(`users/${uid}/devices/dev-z/events/0000000001`, { id: eventId('dev-z', 1), deviceId: 'dev-z', seq: 1, hlc: 'not-an-hlc', kind: 'doc_registered', authorUid: uid, createdAt: adminTimestamp(), payload: {} });
   const r = await b.sync.sync();
   assert.equal(r.quarantined, 1);
   assert.match(r.errors.join(' '), /paused/);
@@ -157,9 +157,22 @@ test('A DOCUMENT-TEXT payload injected on the server is rejected by the engine a
   await adminPut(`users/${uid}/devices/dev-evil`, { deviceId: 'dev-evil' });
   await adminPut(`users/${uid}/devices/dev-evil/events/0000000001`, {
     id: eventId('dev-evil', 1), deviceId: 'dev-evil', seq: 1, hlc: '000000000000001-00000-dev-evil', kind: 'doc_registered',
-    payloadJson: JSON.stringify({ docId: 'a'.repeat(64), title: 'x', sha256: 'a'.repeat(64), length: 1, text: SCHOLARSHIP_TEXT }),
+    authorUid: uid, createdAt: adminTimestamp(), payload: { docId: 'a'.repeat(64), title: 'x', sha256: 'a'.repeat(64), length: 1, text: SCHOLARSHIP_TEXT },
   });
   const r = await b.sync.sync();
   assert.equal(r.quarantined, 1);
   assert.equal((await st(b)).documents.length, 0);
+});
+
+test('DEFENCE IN DEPTH: if a client BUG records document text, the real rules refuse the push, the engine reports it, the event stays pending, and nothing reaches the server', async () => {
+  const uid = await account();
+  const a = await device('a');
+  // bypass the service's guarded write path on purpose: this simulates a bug in a client that the schema limits did not catch locally
+  await a.store.appendLocal('doc_registered', { docId: 'a'.repeat(64), title: 'x', sha256: 'a'.repeat(64), length: 1, text: SCHOLARSHIP_TEXT }, 1_000_000);
+  const r = await a.sync.sync();
+  assert.equal(r.pushed, 0);
+  assert.equal(r.errors.length, 1, `expected one reported push error, got: ${r.errors.join(' | ')}`);
+  assert.match(r.errors.join(' '), /permission|insufficient/i);
+  assert.equal(await a.sync.pendingCount(), 1, 'the refused event stays pending (visible), not silently dropped');
+  assert.equal((await adminList(`users/${uid}/devices/dev-a/events`)).length, 0);
 });

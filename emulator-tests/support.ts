@@ -39,30 +39,54 @@ export async function expectDenied(p: Promise<unknown>, what: string): Promise<v
   assert.fail(`${what}: expected the rules to deny this, but it succeeded`);
 }
 
-// ---- admin (rules-bypass) REST helpers: used ONLY to simulate server-side tampering and to inspect what is actually stored
+// ---- admin (rules-bypass) REST helpers: ONLY to simulate server-side tampering and to inspect what is actually stored
 const base = `http://${FS.host}:${FS.port}/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
 const adminHeaders = { Authorization: 'Bearer owner', 'Content-Type': 'application/json' };
-const enc = (v: string | number) => (typeof v === 'number' ? { integerValue: String(v) } : { stringValue: v });
 
-export async function adminPut(path: string, fields: Record<string, string | number>): Promise<void> {
-  const res = await fetch(`${base}/${path}`, { method: 'PATCH', headers: adminHeaders, body: JSON.stringify({ fields: Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, enc(v)])) }) });
+/** Marker for a server-side timestamp value in admin writes. */
+export const adminTimestamp = (iso = '2026-11-17T10:00:00Z') => ({ __timestamp: iso });
+
+type RestValue = { nullValue?: null; stringValue?: string; booleanValue?: boolean; integerValue?: string; doubleValue?: number; timestampValue?: string; arrayValue?: { values?: RestValue[] }; mapValue?: { fields?: Record<string, RestValue> } };
+
+function toValue(v: unknown): RestValue {
+  if (v === null) return { nullValue: null };
+  if (typeof v === 'string') return { stringValue: v };
+  if (typeof v === 'boolean') return { booleanValue: v };
+  if (typeof v === 'number') return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  if (Array.isArray(v)) return { arrayValue: { values: v.map(toValue) } };
+  if (typeof v === 'object' && v !== null && '__timestamp' in v) return { timestampValue: String((v as { __timestamp: string }).__timestamp) };
+  return { mapValue: { fields: Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, toValue(x)])) } };
+}
+function fromValue(v: RestValue): unknown {
+  if ('nullValue' in v) return null;
+  if (v.stringValue !== undefined) return v.stringValue;
+  if (v.booleanValue !== undefined) return v.booleanValue;
+  if (v.integerValue !== undefined) return Number(v.integerValue);
+  if (v.doubleValue !== undefined) return v.doubleValue;
+  if (v.timestampValue !== undefined) return v.timestampValue;
+  if (v.arrayValue) return (v.arrayValue.values ?? []).map(fromValue);
+  if (v.mapValue) return Object.fromEntries(Object.entries(v.mapValue.fields ?? {}).map(([k, x]) => [k, fromValue(x)]));
+  return undefined;
+}
+const decodeFields = (f: Record<string, RestValue> | undefined): Record<string, unknown> => Object.fromEntries(Object.entries(f ?? {}).map(([k, x]) => [k, fromValue(x)]));
+
+export type StoredFields = Record<string, unknown>;
+
+export async function adminPut(path: string, fields: Record<string, unknown>): Promise<void> {
+  const res = await fetch(`${base}/${path}`, { method: 'PATCH', headers: adminHeaders, body: JSON.stringify({ fields: Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, toValue(v)])) }) });
   assert.ok(res.ok, `admin write failed: ${res.status} ${await res.text()}`);
 }
-
-export type StoredFields = Record<string, string | number>;
-const dec = (f: Record<string, { stringValue?: string; integerValue?: string }>): StoredFields =>
-  Object.fromEntries(Object.entries(f).map(([k, v]) => [k, v.stringValue !== undefined ? v.stringValue : Number(v.integerValue)]));
 
 export async function adminGet(path: string): Promise<StoredFields | null> {
   const res = await fetch(`${base}/${path}`, { headers: adminHeaders });
   if (res.status === 404) return null;
   assert.ok(res.ok, `admin read failed: ${res.status}`);
-  return dec(((await res.json()) as { fields: Record<string, { stringValue?: string; integerValue?: string }> }).fields);
+  return decodeFields(((await res.json()) as { fields?: Record<string, RestValue> }).fields);
 }
 
 export async function adminList(path: string): Promise<{ id: string; fields: StoredFields }[]> {
   const res = await fetch(`${base}/${path}?pageSize=300`, { headers: adminHeaders });
   assert.ok(res.ok, `admin list failed: ${res.status}`);
-  const j = (await res.json()) as { documents?: { name: string; fields: Record<string, { stringValue?: string; integerValue?: string }> }[] };
-  return (j.documents ?? []).map((d) => ({ id: d.name.split('/').pop() as string, fields: dec(d.fields) }));
+  const j = (await res.json()) as { documents?: { name: string; fields?: Record<string, RestValue> }[] };
+  return (j.documents ?? []).map((d) => ({ id: d.name.split('/').pop() as string, fields: decodeFields(d.fields) }));
 }

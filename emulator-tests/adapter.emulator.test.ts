@@ -39,9 +39,11 @@ test('pushEvent: created, then exists_identical on a repeat; the stored record i
   assert.equal(await remote.pushEvent({ ...ev, payload: { length: ev.seq, sha256: SHA, title: 'doc 1', docId: SHA } }), 'exists_identical', 'key order is irrelevant');
   const stored = await adminGet(`users/${uid}/devices/dev-a/events/${padSeq(1)}`);
   if (!stored) { assert.fail('the pushed event is not on the server'); return; }
-  assert.equal(stored.payloadJson, canonicalJson(ev.payload));
+  assert.equal(canonicalJson(stored.payload), canonicalJson(ev.payload), 'the payload is stored as a native map and round-trips exactly');
   assert.equal(stored.id, ev.id);
-  assert.equal(typeof stored.createdAt, 'undefined', 'serverTimestamp is stored as a timestamp, not a string/integer');
+  assert.equal(stored.authorUid, uid, 'the adapter records the signed-in user as the author');
+  assert.equal(typeof stored.createdAt, 'string', 'createdAt is a server timestamp');
+  assert.deepEqual(Object.keys(stored).sort(), ['authorUid', 'createdAt', 'deviceId', 'hlc', 'id', 'kind', 'payload', 'seq'], 'exactly the fields the rules allow');
 });
 
 test('TAMPERED EVENTS: a different event under an existing id is reported exists_different and the server copy is NOT overwritten', async () => {
@@ -50,9 +52,9 @@ test('TAMPERED EVENTS: a different event under an existing id is reported exists
   await remote.pushEvent(mkEvent('dev-a', 1));
   const forged = mkEvent('dev-a', 1, { docId: SHA, title: 'FORGED', sha256: SHA, length: 1 });
   assert.equal(await remote.pushEvent(forged), 'exists_different');
-  assert.match((await adminGet(`users/${uid}/devices/dev-a/events/${padSeq(1)}`))?.payloadJson as string, /doc 1/);
+  assert.match(canonicalJson((await adminGet(`users/${uid}/devices/dev-a/events/${padSeq(1)}`))?.payload), /doc 1/);
   // and a server-side tamper (rules bypassed, simulating a compromised backend) is detected by the next push of the original
-  await adminPut(`users/${uid}/devices/dev-a/events/${padSeq(1)}`, { payloadJson: '{"tampered":true}' });
+  await adminPut(`users/${uid}/devices/dev-a/events/${padSeq(1)}`, { payload: { tampered: true } });
   assert.equal(await remote.pushEvent(mkEvent('dev-a', 1)), 'exists_different');
 });
 
@@ -71,11 +73,11 @@ test('pullEvents: ordered by seq across the 9 -> 10 boundary, honours afterSeq a
   assert.equal(canonicalJson(pulled[11]), canonicalJson(evs[11]));
 });
 
-test('a corrupted payloadJson on the server is delivered as an undefined payload for the sync engine to quarantine, not thrown', async () => {
+test('a corrupted (non-map) payload on the server is delivered as an undefined payload for the sync engine to quarantine, not thrown', async () => {
   const { remote, uid } = await owner();
   await remote.registerDevice('dev-a');
   await remote.pushEvent(mkEvent('dev-a', 1));
-  await adminPut(`users/${uid}/devices/dev-a/events/${padSeq(1)}`, { payloadJson: 'not json {' });
+  await adminPut(`users/${uid}/devices/dev-a/events/${padSeq(1)}`, { payload: 'not a map' });
   const [raw] = (await remote.pullEvents('dev-a', 0, 10)) as { payload: unknown }[];
   assert.equal(raw?.payload, undefined);
 });
@@ -103,7 +105,7 @@ test('CONCURRENT PUSHES with DIFFERENT content under one id: one wins, the other
   const results = await Promise.all([a.remote.pushEvent(x), remote2.pushEvent(y)]);
   assert.deepEqual([...results].sort(), ['created', 'exists_different']);
   const stored = await adminGet(`users/${a.uid}/devices/dev-a/events/${padSeq(1)}`);
-  assert.ok(stored?.payloadJson === canonicalJson(x.payload) || stored?.payloadJson === canonicalJson(y.payload));
+  assert.ok(canonicalJson(stored?.payload) === canonicalJson(x.payload) || canonicalJson(stored?.payload) === canonicalJson(y.payload));
   assert.equal((await adminList(`users/${a.uid}/devices/dev-a/events`)).length, 1);
 });
 
@@ -126,4 +128,17 @@ test('an unauthenticated adapter is denied everywhere', async () => {
   const remote = new FirestoreRemote(anon.db, a.uid);
   await expectDenied(remote.listDevices(), 'anonymous listDevices');
   await expectDenied(remote.pushEvent(mkEvent('dev-a', 1)), 'anonymous pushEvent');
+});
+
+test('EVERY WRITE PATH THROUGH THE ADAPTER OBEYS THE RULES: an event carrying document text or an unexpected field is refused by the real rules, and nothing is stored', async () => {
+  const { remote, uid } = await owner();
+  await remote.registerDevice('dev-a');
+  const withText = mkEvent('dev-a', 1, { docId: SHA, title: 'x', sha256: SHA, length: 1, text: 'the whole document text' });
+  await expectDenied(remote.pushEvent(withText), 'adapter pushing a doc_registered event with a text field');
+  const extra = mkEvent('dev-a', 2, { docId: SHA, title: 'x', sha256: SHA, length: 1, documentBody: 'x' });
+  await expectDenied(remote.pushEvent(extra), 'adapter pushing an event with an unexpected payload field');
+  const huge = mkEvent('dev-a', 3, { docId: SHA, title: 'T'.repeat(501), sha256: SHA, length: 1 });
+  await expectDenied(remote.pushEvent(huge), 'adapter pushing an oversized title');
+  assert.equal((await adminList(`users/${uid}/devices/dev-a/events`)).length, 0);
+  assert.equal(await remote.pushEvent(mkEvent('dev-a', 1)), 'created', 'a valid event with the same id is still accepted afterwards');
 });
