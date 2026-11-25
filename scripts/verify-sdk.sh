@@ -38,4 +38,23 @@ show "CustomProviderOptions"       "$AC" "interface CustomProviderOptions\\b" 8
 show "getToken"                    "$AC" "function getToken\\b" 2
 show "AppCheckTokenResult"         "$AC" "interface AppCheckTokenResult\\b" 4
 show "ReCaptchaEnterpriseProvider" "$AC" "class ReCaptchaEnterpriseProvider\\b" 4
+echo; echo "== Phase 2: @firebase/auth and @firebase/firestore declarations =="
+AU=node_modules/@firebase/auth
+FS=node_modules/@firebase/firestore
+if [ ! -d "$AU" ] || [ ! -d "$FS" ]; then
+  echo "NOT INSTALLED: missing $AU or $FS. Nothing below was checked."
+else
+  show "getAuth"                        "$AU" "function getAuth\\b" 2
+  show "createUserWithEmailAndPassword" "$AU" "function createUserWithEmailAndPassword\\b" 2
+  show "signInWithEmailAndPassword"     "$AU" "function signInWithEmailAndPassword\\b" 2
+  show "signOut"                        "$AU" "function signOut\\b" 2
+  show "onAuthStateChanged"             "$AU" "function onAuthStateChanged\\b" 3
+  show "getFirestore"                   "$FS" "function getFirestore\\b" 2
+  show "runTransaction"                 "$FS" "function runTransaction\\b" 3
+  show "documentId"                     "$FS" "function documentId\\b" 2
+  show "startAfter"                     "$FS" "function startAfter\\b" 3
+  show "orderBy"                        "$FS" "function orderBy\\b" 2
+  show "setDoc (merge option)"          "$FS" "function setDoc\\b" 3
+  show "serverTimestamp"                "$FS" "function serverTimestamp\\b" 2
+fi
 echo; echo "== done: send sdk-verify.txt together with the output of npm run typecheck =="
